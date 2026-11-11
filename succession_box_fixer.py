@@ -43,8 +43,11 @@ Usage examples::
     # Preview everything, ask before each save (default behaviour)
     python succession_box_fixer.py
 
-    # Only the 'incumbent' subcategories, no saving, write a report
-    python succession_box_fixer.py -only:incumbent -simulate -report:report.tsv
+    # Report only: read every page, write what it would do, edit nothing
+    python succession_box_fixer.py -reportonly
+
+    # Report only, just the 'incumbent' subcategories
+    python succession_box_fixer.py -reportonly -only:incumbent -report:inc.tsv
 
     # Specific pages / any pywikibot page generator
     python succession_box_fixer.py -page:"Some article" -always
@@ -56,7 +59,10 @@ Options:
 
 -only:<text>      Only process subcategories whose name contains <text>
                   (case-insensitive), e.g. -only:incumbent, -only:"'before'".
--report:<file>    Write unfixed/skipped cases to a TSV file
+-reportonly      Never edit anything (no login, no prompts): only read the
+                  pages and write the report. Implies -report.
+-report:<file>    Write a TSV report with one row per misused value: what it
+                  would be / was replaced with, or why it needs a manual fix
                   (default name: succession_box_report.tsv).
 -allowlinks       Also convert "abolished"/"dissolved"/"extinct" values that
                   contain wikilinks into {{s-non|reason=...}}.
@@ -382,6 +388,8 @@ class Result:
     text: str
     changes: Counter
     unfixed: list   # [(template, param, value, why)]
+    fixed: list = field(default_factory=list)
+    # fixed: [(template, param, old value, replacement wikitext)]
 
 
 def _params(tpl: Template) -> dict:
@@ -422,6 +430,7 @@ class Fixer:
         code = mwp.parse(text)
         self._changes = Counter()
         self._unfixed = []
+        self._fixed = []
         self._need_start = {}   # id -> node (s-vac in "before" position)
         self._need_end = {}     # id -> node (s-vac/s-non in "after" position)
 
@@ -432,7 +441,7 @@ class Fixer:
             self._fix_rows(wc)
         new = str(code)
         self._find_leftovers(new)
-        return Result(new, self._changes, self._unfixed)
+        return Result(new, self._changes, self._unfixed, self._fixed)
 
     # -- traversal ----------------------------------------------------------
 
@@ -492,6 +501,7 @@ class Fixer:
         new = _build(rep.kind, rep.params, cap)
         self._mark(new, rep, side)
         self._changes[f'{tname}→{rep.kind}'] += 1
+        self._fixed.append((tname, side, value, str(new)))
         return [new]
 
     def _classify(self, tname, side, value):
@@ -543,6 +553,9 @@ class Fixer:
         node.add('title', m.group('t'))     # mwparserfromhell keeps spacing
         node.add('with', m.group('w').strip())
         self._changes[f'{tname}: title<br>with→|with='] += 1
+        self._fixed.append((tname, 'title', title.strip(),
+                            f'title={m.group("t").strip()} '
+                            f'|with={m.group("w").strip()}'))
         return True
 
     # -- {{Succession box}} ---------------------------------------------------
@@ -616,8 +629,10 @@ class Fixer:
         parts = []
         if b_rep:
             parts.append(f'before→{b_rep.kind}')
+            self._fixed.append((tname, 'before', before, str(bef)))
         if a_rep:
             parts.append(f'after→{a_rep.kind}')
+            self._fixed.append((tname, 'after', after, str(aft)))
         self._changes[f'succession box split ({", ".join(parts)})'] += 1
         return [bef, Text('\n'), ttl, Text('\n'), aft]
 
@@ -707,6 +722,11 @@ def make_summary(changes: Counter) -> str:
 # pywikibot bot
 # ---------------------------------------------------------------------------
 
+DEFAULT_REPORT = 'succession_box_report.tsv'
+REPORT_HEADER = ('page', 'status', 'template', 'param', 'current value',
+                 'replacement / reason')
+
+
 def load_aliases(site) -> dict:
     """Map every redirect name of the templates we care about to its
     canonical name."""
@@ -745,6 +765,7 @@ def main(*args: str) -> None:
     class SuccessionBoxBot(SingleSiteBot, ExistingPageBot):
         update_options = {
             'report': None,
+            'reportonly': False,
             'allowlinks': False,
             'summary': None,
         }
@@ -753,8 +774,29 @@ def main(*args: str) -> None:
             super().__init__(**kwargs)
             self.fixer = Fixer(load_aliases(self.site),
                                allow_links=self.opt.allowlinks)
-            self.report_rows = []
             self.stats = Counter()
+            self.report_file = self.report_writer = None
+            if self.opt.report:
+                # utf-8-sig so Excel detects the encoding; rows are written
+                # (and flushed) page by page so an interrupted run keeps
+                # everything done so far.
+                self.report_file = open(self.opt.report, 'w', newline='',
+                                        encoding='utf-8-sig')
+                self.report_writer = csv.writer(self.report_file,
+                                                delimiter='\t')
+                self.report_writer.writerow(REPORT_HEADER)
+                self.report_file.flush()
+
+        def write_report(self, title, result, fixed_status):
+            if not self.report_writer:
+                return
+            for tname, param, value, new in result.fixed:
+                self.report_writer.writerow(
+                    (title, fixed_status, tname, param, value, new))
+            for tname, param, value, why in result.unfixed:
+                self.report_writer.writerow(
+                    (title, 'needs manual fix', tname, param, value, why))
+            self.report_file.flush()
 
         def skip_page(self, page):
             if page.namespace() != 0:
@@ -770,32 +812,42 @@ def main(*args: str) -> None:
         def treat_page(self):
             page = self.current_page
             result = self.fixer.fix(page.text)
-            for tname, param, value, why in result.unfixed:
-                self.report_rows.append(
-                    (page.title(), tname, param, value, why))
-            self.stats['unfixed'] += len(result.unfixed)
+            self.stats['pages checked'] += 1
+            self.stats['values that need a manual fix'] += len(
+                result.unfixed)
+            if result.unfixed:
+                self.stats['pages with values needing a manual fix'] += 1
+
+            if self.opt.reportonly:
+                # Never edits, never logs in, never asks for confirmation.
+                self.write_report(page.title(), result, 'would fix')
+                n = len(result.fixed)
+                pywikibot.info(f'{n} fixable, {len(result.unfixed)} '
+                               'need a manual fix')
+                if n:
+                    self.stats['pages the bot would edit'] += 1
+                    self.stats['values the bot would fix'] += n
+                return
+
             if not result.changes:
                 pywikibot.info('No safely fixable succession box issues.')
-                self.stats['nothing to do'] += 1
+                self.write_report(page.title(), result, 'fixed')
                 return
             summary = self.opt.summary or make_summary(result.changes)
-            if self.put_current(result.text, summary=summary):
+            saved = self.put_current(result.text, summary=summary)
+            self.write_report(page.title(), result,
+                              'fixed' if saved else 'not saved')
+            if saved:
                 # With -always pywikibot saves asynchronously, so this
                 # counts edits submitted; failures are logged separately.
                 self.stats['edits submitted'] += 1
-                self.stats.update(result.changes)
+                self.stats['values fixed'] += len(result.fixed)
 
         def teardown(self):
-            if self.opt.report:
-                with open(self.opt.report, 'w', newline='',
-                          encoding='utf-8') as fh:
-                    writer = csv.writer(fh, delimiter='\t')
-                    writer.writerow(['page', 'template', 'param', 'value',
-                                     'why'])
-                    writer.writerows(self.report_rows)
-                pywikibot.info(f'Wrote {len(self.report_rows)} unfixed '
-                               f'cases to {self.opt.report}')
-            for key, n in self.stats.most_common():
+            if self.report_file:
+                self.report_file.close()
+                pywikibot.info(f'Report written to {self.opt.report}')
+            for key, n in sorted(self.stats.items()):
                 pywikibot.info(f'{key}: {n}')
             super().teardown()
 
@@ -812,7 +864,9 @@ def main(*args: str) -> None:
         elif opt == '-allowlinks':
             options['allowlinks'] = True
         elif opt == '-report':
-            options['report'] = value or 'succession_box_report.tsv'
+            options['report'] = value or DEFAULT_REPORT
+        elif opt == '-reportonly':
+            options['reportonly'] = True
         elif opt == '-summary':
             options['summary'] = value
         elif opt == '-only':
@@ -820,6 +874,10 @@ def main(*args: str) -> None:
         else:
             pywikibot.bot.suggest_help(unknown_parameters=[arg])
             return
+
+    if options.get('reportonly'):
+        options.setdefault('report', DEFAULT_REPORT)
+        options.pop('always', None)
 
     site = pywikibot.Site()
     gen = gen_factory.getCombinedGenerator(preload=True)

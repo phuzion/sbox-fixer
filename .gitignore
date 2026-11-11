@@ -6,4 +6,4 @@ user-password.py
 apicache*/
 logs/
 throttle.ctrl
-succession_box_report*.tsv
+*.tsv

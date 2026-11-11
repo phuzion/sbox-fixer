@@ -205,6 +205,17 @@ class WikitextTests(unittest.TestCase):
         r = fix('{{s-aft|after=Vacant}}\n{{s-rel|ca}}')
         self.assertEqual(r.text, '{{s-vac}}\n{{s-rel|ca}}')
 
+    def test_fixed_list_for_report(self):
+        r = fix('{{s-aft|after=Incumbent}}\n'
+                '{{succession box|before=New office|title=T|after=[[B]]}}\n'
+                '{{s-bef|before=Vacant until 1927}}')
+        self.assertEqual(r.fixed, [
+            ('s-aft', 'after', 'Incumbent', '{{s-inc}}'),
+            ('succession box', 'before', 'New office', '{{s-new|office}}'),
+        ])
+        self.assertEqual([u[:3] for u in r.unfixed],
+                         [('s-bef', 'before', 'Vacant until 1927')])
+
     def test_summary(self):
         r = fix('{{s-aft|after=Incumbent}}\n{{s-aft|after=Incumbent}}')
         self.assertIn('s-aft→s-inc ×2', make_summary(r.changes))
