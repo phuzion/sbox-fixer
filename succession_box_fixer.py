@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""Fix succession-box template misuse on English Wikipedia.
+
+Works through the subcategories of
+[[Category:Succession box misuse tracking]] and rewrites the misused
+cells into the dedicated templates that the tracking categories ask for:
+
+=====================================  ===================================
+Misuse                                 Replacement
+=====================================  ===================================
+after = Incumbent                      {{s-inc}}
+after = Vacant / Post vacant           {{s-vac}}
+after = Vacant, next held by [[X]]     {{s-vac|next=[[X]]}}
+after = Unknown                        {{s-vac|unknown}}
+after = Unknown, then [[X]]            {{s-vac|unknown|unknnext=[[X]]}}
+after = Suspended                      {{s-vac|suspended}}
+after = Sede vacante / See vacant      {{s-vac|sedevacante}}
+after = Office abolished / dissolved   {{s-non|reason=Office abolished}}
+        / Title extinct
+before = New office / Office created   {{s-new|office}}
+before = Newly created / Created       {{s-new}}
+before = Position recreated            {{s-vac|recreated}}
+before = Vacant, last held by [[X]]    {{s-vac|last=[[X]]}}
+before = Unknown / Vacant              {{s-vac|unknown}} / {{s-vac}}
+title = Foo<br />with Bar  (s-ttl)     title=Foo |with=Bar
+=====================================  ===================================
+
+``{{Succession box}}`` calls are split into ``{{s-bef}}``/``{{s-ttl}}``/
+``{{s-aft}}`` (or their replacements) because it has no way to express
+"incumbent", "vacant", etc.
+
+The rules are deliberately conservative: a value is only rewritten when the
+*whole* value matches a known pattern. Anything else (values that name a
+real successor, carry references, templates, comments, footnotes, ...) is
+left alone and written to the report file for manual review.
+
+``{{s-vac}}`` and ``{{s-non}}`` do not emit table-row markup the way
+``{{s-bef}}``/``{{s-aft}}`` do, so the bot adds a ``|-`` line next to them
+when the neighbouring template would not already start/end the row.
+
+Usage examples::
+
+    # Preview everything, ask before each save (default behaviour)
+    python succession_box_fixer.py
+
+    # Only the 'incumbent' subcategories, no saving, write a report
+    python succession_box_fixer.py -only:incumbent -simulate -report:report.tsv
+
+    # Specific pages / any pywikibot page generator
+    python succession_box_fixer.py -page:"Some article" -always
+
+    # Offline: run the fixer on a local wikitext file and print the diff
+    python succession_box_fixer.py -testfile:sample.wiki
+
+Options:
+
+-only:<text>      Only process subcategories whose name contains <text>
+                  (case-insensitive), e.g. -only:incumbent, -only:"'before'".
+-report:<file>    Write unfixed/skipped cases to a TSV file
+                  (default name: succession_box_report.tsv).
+-allowlinks       Also convert "abolished"/"dissolved"/"extinct" values that
+                  contain wikilinks into {{s-non|reason=...}}.
+-summary:<text>   Override the edit summary.
+-always           Save without asking for confirmation.
+-testfile:<file>  Offline mode: fix a local file and print a diff.
+
+Standard pywikibot global options (-simulate, -lang, -family, -user,
+-pt:<seconds> ...) and page generator options (-cat:, -page:, -file:,
+-limit:, ...) also work. Without a generator option the pages of every
+subcategory of the tracking category are processed.
+
+Running this unattended on English Wikipedia requires an approved bot
+request (WP:BRFA) and a bot account.
+"""
+from __future__ import annotations
+
+import csv
+import difflib
+import itertools
+import re
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+
+import mwparserfromhell as mwp
+from mwparserfromhell.nodes import Comment, Template, Text
+
+TRACKING_CAT = 'Succession box misuse tracking'
+
+# ---------------------------------------------------------------------------
+# Template names
+# ---------------------------------------------------------------------------
+
+# Canonical names we need to recognise (redirects are added at runtime).
+# Succession-box header templates; each one starts with a "|-" row.
+HEADERS = (
+    's-reg', 's-off', 's-mil', 's-ppo', 's-gov', 's-dip', 's-aca',
+    's-sports', 's-rel', 's-hon', 's-par', 's-hou', 's-pre', 's-other',
+    's-media', 's-bus', 's-legal', 's-ach', 's-court', 's-culture',
+    's-edu', 's-civ', 's-npo',
+)
+
+# Canonical names we need to recognise (redirects are added at runtime).
+CANONICAL = (
+    's-aft', 's-bef', 's-ttl', 'succession box',
+    's-inc', 's-new', 's-vac', 's-non',
+    's-start', 's-end', 's-break', 'end',
+) + HEADERS
+
+# Templates whose output ends with a "|-" row separator (or opens a table),
+# so a following cell that does not start its own row is still fine.
+ROW_ENDERS = {'s-aft', 's-inc', 's-break', 's-start', 'succession box'}
+
+# Templates whose output starts a new row (or closes the table).
+ROW_STARTERS = {
+    's-bef', 's-new', 's-end', 'end', 's-break', 's-start', 'succession box',
+} | set(HEADERS)
+
+
+def norm_name(name: str) -> str:
+    """Normalise a template name for lookup."""
+    name = str(name)
+    name = re.sub(r'<!--.*?-->', '', name, flags=re.S)
+    name = name.replace('_', ' ').strip()
+    name = re.sub(r'^(?:template|msg)\s*:\s*', '', name, flags=re.I)
+    name = re.sub(r'\s+', ' ', name)
+    return name.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tracking-category detection (mirrors the /check sub-templates)
+# ---------------------------------------------------------------------------
+
+AFTER_TRACKED = re.compile(
+    r'[vV]acant|[iI]ncumbent|[aA]bolished|[sS]uspended|[dD]issolved'
+    r'|[uU]nknown|[eE]xtinct')
+BEFORE_TRACKED = re.compile(
+    r'^\s*[nN][eE][wW]|[cC]reated|[vV]acant|[sS]uspended|[uU]nknown')
+TITLE_WITH = re.compile(r'<br ?/?>\s*with\s')
+
+
+def tracked_after(value: str) -> bool:
+    return bool(value) and bool(AFTER_TRACKED.search(value))
+
+
+def tracked_before(value: str) -> bool:
+    return bool(value) and bool(BEFORE_TRACKED.search(value))
+
+
+# ---------------------------------------------------------------------------
+# Value classification
+# ---------------------------------------------------------------------------
+
+UNSAFE = re.compile(
+    r'<!--|\{\{|\}\}|<ref|<sup|\{\||\[https?:|\[//|<math|<nowiki|<gallery',
+    re.I)
+
+
+def flatten(value: str) -> tuple[str, int] | None:
+    """Strip presentational markup.
+
+    Returns (single-line text with wikilinks kept, number of lines), or
+    None when the value contains markup we do not want to touch.
+    """
+    if UNSAFE.search(value):
+        return None
+    t = re.sub(r"'{2,}", '', value)
+    t = re.sub(r'</?(?:small|big|span|b|i|em|strong|center|div|font)\b[^>]*>',
+               '', t, flags=re.I)
+    t = re.sub(r'<br\s*/?\s*>', '\n', t, flags=re.I)
+    t = t.replace('&nbsp;', ' ')
+    if '<' in t or '>' in t:
+        return None
+    lines = [re.sub(r'\s+', ' ', ln).strip() for ln in t.split('\n')]
+    lines = [ln for ln in lines if ln]
+    return ' '.join(lines), len(lines)
+
+
+def unlink(text: str) -> str:
+    return re.sub(r'\[\[(?:[^\[\]|]*\|)?([^\[\]|]*)\]\]', r'\1', text)
+
+
+def core(text: str) -> str:
+    """Lower-cased, unlinked text without wrapping brackets/punctuation."""
+    t = unlink(text)
+    t = re.sub(r'[←-↓]', '', t).strip()
+    while True:
+        old = t
+        t = t.strip().rstrip('.,;:').strip()
+        if len(t) >= 2 and ((t[0], t[-1]) in (('(', ')'), ('[', ']'))):
+            t = t[1:-1]
+        if t == old:
+            break
+    return re.sub(r'\s+', ' ', t).lower()
+
+
+# Words that may precede "vacant"/"suspended".
+_SEAT = r'post|position|office|seat|title|throne|chair|see|bishopric|stool'
+VAC_ONLY = re.compile(
+    rf'(?:(?:n/?a|none)\s*[,;:]?\s*)?\(?(?:(?:{_SEAT})\s+)?vacant'
+    rf'(?:\s+(?:{_SEAT}))?\)?')
+SEDE_ONLY = re.compile(r'\(?(?:sede\s+vacante|see\s+vacant)\)?')
+UNK_ONLY = re.compile(
+    r'\(?(?:(?:name|holder|successor|predecessor|incumbent)\s+)?unknown\)?')
+SUSP_ONLY = re.compile(
+    rf'\(?(?:(?:{_SEAT}|league|competition|tournament|championship|award'
+    rf'|event|series)\s+)?(?:temporarily\s+)?suspended\)?')
+INC_ONLY = re.compile(
+    r'(?:(?:n/?a|none)\s*[,;:]?\s*)?[(\[]?\s*(?:the\s+)?(?:current\s+)?'
+    r'incumbent\s*[)\]]?')
+
+# A single person: one wikilink or a short run of capitalised words,
+# optionally with an honorific and a regnal number.
+_HON = (r'(?:(?:Sir|Dame|Lord|Lady|Prince|Princess|King|Queen|Saint|St\.'
+        r'|Pope|Bishop|Archbishop|Cardinal|Rev\.|Dr\.)\s+)?')
+_LINK = r'\[\[[^\[\]|]+(?:\|[^\[\]|]+)?\]\]'
+_UC = r'[A-ZÀ-ÞĀ-ɏ]'
+_NAME = (rf"{_UC}[\w.'’\-]*(?:\s+(?:{_UC}[\w.'’\-]*"
+         r'|de|du|des|von|van|der|den|of|la|le|da|di|y|al|bin|ibn)){0,6}')
+_PERSON = rf'(?P<who>{_HON}(?:{_LINK}|{_NAME})(?:\s+[IVXL]+)?)'
+
+_VAC_WORD = rf'(?i:(?:(?P<seat>{_SEAT})\s+)?vacant)'
+_SEP = r'\s*[,;:\-–]?\s*'
+VAC_NEXT = re.compile(
+    rf'\(?{_VAC_WORD}\)?{_SEP}\(?\s*(?i:(?:title\s+)?(?:next\s+held\s+by'
+    rf'|next\s+incumbent|next\s+holder|then|later|followed\s+by))'
+    rf'\s*:?\s*{_PERSON}\s*\)?\.?')
+VAC_LAST = re.compile(
+    rf'\(?{_VAC_WORD}\)?{_SEP}\(?\s*(?i:(?:title\s+)?(?:last\s+held\s+by'
+    rf'|previously\s+held\s+by|last\s+preceded\s+by|previously(?:\s+by)?-?'
+    rf'|last\s+holder|formerly\s+held\s+by))\s*:?\s*{_PERSON}\s*\)?\.?')
+UNK_NEXT = re.compile(
+    rf'\(?(?i:unknown)\)?{_SEP}(?i:then|later|next\s+known(?:\s+holder)?'
+    rf'|followed\s+by)\s*:?\s*{_PERSON}\.?')
+UNK_LAST = re.compile(
+    rf'\(?(?i:unknown)\)?{_SEP}(?i:last\s+known(?:\s+holder)?|previously'
+    rf'|earlier|preceded\s+by)\s*:?\s*{_PERSON}\.?')
+
+# Map of nouns used with "New ..." / "... created" to {{s-new}} codes.
+# '' means the template default ("New title").
+NEW_NOUNS = {
+    'office': 'office', 'post': 'post', 'position': 'post',
+    'seat': 'seat', 'district': 'district', 'electoral district': 'district',
+    'constituency': 'constituency', 'riding': 'riding',
+    'division': 'division', 'diocese': 'diocese', 'archdiocese': 'diocese',
+    'eparchy': 'diocese', 'see': 'diocese', 'bishopric': 'diocese',
+    'award': 'award', 'prize': 'award',
+    'championship': 'championship', 'chart': 'chart', 'command': 'command',
+    'convention': 'convention', 'creation': 'creation', 'title': '',
+    'department': 'department', 'dicastery': 'dicastery',
+    'institution': 'institution', 'university': 'university',
+    'regiment': 'regiment', 'unit': 'unit', 'programme': 'programme',
+    'program': 'programme', 'parliament': 'parliament',
+    'assembly': 'assembly', 'forum': 'forum', 'party': 'party',
+    'political party': 'party', 'ministerial post': 'minister',
+    'show': 'show', 'television show': 'tv', 'tv show': 'tv',
+    'sporting event': 'sports',
+}
+_NOUN = '|'.join(sorted(map(re.escape, NEW_NOUNS), key=len, reverse=True))
+_MADE_WORDS = 'created|established|formed|founded|instituted|constituted'
+_MADE = rf'(?:{_MADE_WORDS})'
+NEW_A = re.compile(
+    rf'(?:none[,;:]?\s+)?(?:new|newly\s+(?:{_MADE_WORDS}|activated))'
+    rf'(?:\s+(?P<noun>{_NOUN}))?')
+NEW_B = re.compile(
+    rf'(?:none[,;:]?\s+)?(?:(?:new|newly)\s+)?(?:(?P<noun>{_NOUN})\s+)?'
+    rf'(?:newly\s+)?{_MADE}')
+RECREATED = re.compile(rf'(?:(?:{_NOUN})\s+)?re-?created')
+
+NON_KEYWORDS = re.compile(r'abolished|dissolved|extinct', re.I)
+OTHER_KEYWORDS = re.compile(r'vacant|incumbent|unknown|suspended|new', re.I)
+
+
+@dataclass
+class Replacement:
+    kind: str                      # 's-inc', 's-vac', 's-non', 's-new'
+    params: list = field(default_factory=list)  # [(name or None, value)]
+
+    @property
+    def starts_row(self) -> bool:
+        return self.kind in ('s-new',)
+
+    @property
+    def ends_row(self) -> bool:
+        return self.kind in ('s-inc',)
+
+    def supports(self, param: str) -> bool:
+        return param == 'rows' or (param == 'as' and self.kind == 's-vac')
+
+
+def _person_params(m: re.Match, key: str) -> list:
+    return [(key, m.group('who').strip())]
+
+
+def _vac_code(seat: str | None) -> list:
+    if seat and seat.lower() == 'see':
+        return [(None, 'sedevacante')]
+    return []
+
+
+def classify(value: str, side: str, allow_links: bool = False
+             ) -> tuple[Replacement | None, str]:
+    """Return (replacement, reason-if-none) for a before/after value."""
+    flat = flatten(value)
+    if flat is None:
+        return None, 'contains templates/refs/comments/HTML'
+    text, nlines = flat
+    c = core(text)
+    if not c:
+        return None, 'empty after cleanup'
+
+    if SEDE_ONLY.fullmatch(c):
+        return Replacement('s-vac', [(None, 'sedevacante')]), ''
+    if VAC_ONLY.fullmatch(c):
+        return Replacement('s-vac'), ''
+    if UNK_ONLY.fullmatch(c):
+        return Replacement('s-vac', [(None, 'unknown')]), ''
+    if SUSP_ONLY.fullmatch(c):
+        return Replacement('s-vac', [(None, 'suspended')]), ''
+
+    if side == 'after':
+        if INC_ONLY.fullmatch(c):
+            return Replacement('s-inc'), ''
+        m = VAC_NEXT.fullmatch(text)
+        if m:
+            return Replacement('s-vac', _vac_code(m.group('seat'))
+                               + _person_params(m, 'next')), ''
+        m = UNK_NEXT.fullmatch(text)
+        if m:
+            return Replacement('s-vac', [(None, 'unknown')]
+                               + _person_params(m, 'unknnext')), ''
+        if NON_KEYWORDS.search(c):
+            return _classify_non(text, c, nlines, allow_links)
+        return None, 'no safe pattern matched'
+
+    # side == 'before'
+    m = VAC_LAST.fullmatch(text)
+    if m:
+        return Replacement('s-vac', _vac_code(m.group('seat'))
+                           + _person_params(m, 'last')), ''
+    m = UNK_LAST.fullmatch(text)
+    if m:
+        return Replacement('s-vac', [(None, 'unknown')]
+                           + _person_params(m, 'unknlast')), ''
+    if RECREATED.fullmatch(c):
+        return Replacement('s-vac', [(None, 'recreated')]), ''
+    m = NEW_A.fullmatch(c) or NEW_B.fullmatch(c)
+    if m:
+        code = NEW_NOUNS.get(m.group('noun') or '', '')
+        return Replacement('s-new', [(None, code)] if code else []), ''
+    return None, 'no safe pattern matched'
+
+
+def _classify_non(text, c, nlines, allow_links):
+    if nlines > 1:
+        return None, 'abolished/dissolved/extinct value spans several lines'
+    if '[[' in text and not allow_links:
+        return None, 'abolished/dissolved/extinct value contains links'
+    if OTHER_KEYWORDS.search(unlink(text)):
+        return None, 'mixed keywords'
+    if len(text) > 120:
+        return None, 'value too long'
+    reason = re.sub(r'^(?i:none|n/a|nobody)\s*[,;:\-–]?\s*', '', text)
+    reason = reason.strip().rstrip('.').strip()
+    while reason.startswith('(') and reason.endswith(')'):
+        reason = reason[1:-1].strip()
+    if not reason:
+        return None, 'empty reason'
+    if reason[0].isalpha():
+        reason = reason[0].upper() + reason[1:]
+    if '=' in reason or '|' in unlink(reason):
+        return None, 'reason contains = or |'
+    return Replacement('s-non', [('reason', reason)]), ''
+
+
+# ---------------------------------------------------------------------------
+# Wikitext rewriting
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Result:
+    text: str
+    changes: Counter
+    unfixed: list   # [(template, param, value, why)]
+
+
+def _params(tpl: Template) -> dict:
+    return {str(p.name).strip(): str(p.value).strip() for p in tpl.params}
+
+
+def _build(kind: str, params: list, cap: bool) -> Template:
+    name = kind[0].upper() + kind[1:] if cap else kind
+    parts = []
+    for key, value in params:
+        parts.append(f'|{key}={value}' if key else f'|{value}')
+    return mwp.parse('{{' + name + ''.join(parts) + '}}').nodes[0]
+
+
+def _is_blank(node) -> bool:
+    return isinstance(node, Comment) or (
+        isinstance(node, Text) and not str(node).strip())
+
+
+class Fixer:
+    """Pure wikitext fixer (no network access)."""
+
+    def __init__(self, aliases: dict | None = None,
+                 allow_links: bool = False):
+        self.aliases = {n: n for n in CANONICAL}
+        if aliases:
+            self.aliases.update(aliases)
+        self.allow_links = allow_links
+
+    def canon(self, node) -> str | None:
+        if not isinstance(node, Template):
+            return None
+        return self.aliases.get(norm_name(node.name))
+
+    # -- public -------------------------------------------------------------
+
+    def fix(self, text: str) -> Result:
+        code = mwp.parse(text)
+        self._changes = Counter()
+        self._unfixed = []
+        self._need_start = {}   # id -> node (s-vac in "before" position)
+        self._need_end = {}     # id -> node (s-vac/s-non in "after" position)
+
+        wikicodes = list(self._walk(code))
+        for wc in reversed(wikicodes):      # innermost first
+            self._fix_nodes(wc)
+        for wc in self._walk(code):
+            self._fix_rows(wc)
+        new = str(code)
+        self._find_leftovers(new)
+        return Result(new, self._changes, self._unfixed)
+
+    # -- traversal ----------------------------------------------------------
+
+    def _walk(self, wc):
+        yield wc
+        for node in wc.nodes:
+            if isinstance(node, Template):
+                for p in node.params:
+                    yield from self._walk(p.value)
+            elif getattr(node, 'contents', None) is not None and hasattr(
+                    node.contents, 'nodes'):
+                yield from self._walk(node.contents)
+
+    def _fix_nodes(self, wc):
+        i = 0
+        while i < len(wc.nodes):
+            node = wc.nodes[i]
+            new_nodes = None
+            canon = self.canon(node)
+            if canon == 's-aft':
+                new_nodes = self._fix_cell(node, 'after')
+            elif canon == 's-bef':
+                new_nodes = self._fix_cell(node, 'before')
+            elif canon == 's-ttl':
+                self._fix_title(node, 's-ttl')
+            elif canon == 'succession box':
+                new_nodes = self._fix_sbox(node)
+            if new_nodes:
+                wc.nodes[i:i + 1] = new_nodes
+                i += len(new_nodes)
+            else:
+                i += 1
+
+    # -- s-bef / s-aft ------------------------------------------------------
+
+    def _fix_cell(self, node: Template, side: str):
+        tname = 's-aft' if side == 'after' else 's-bef'
+        params = _params(node)
+        value = params.get(side, '')
+        if not (tracked_after(value) if side == 'after'
+                else tracked_before(value)):
+            return None
+        allowed = {side, 'rows', 'as'} | {f'{side}{n}' for n in range(2, 11)}
+        extra = {k for k in set(params) - allowed if params[k]}
+        if extra:
+            return self._skip(tname, side, value,
+                              f'unexpected parameters: {sorted(extra)}')
+        if any(params.get(f'{side}{n}') for n in range(2, 11)):
+            return self._skip(tname, side, value,
+                              f'has {side}2+ parameters')
+        rep = self._classify(tname, side, value)
+        if rep is None:
+            return None
+        if not self._carry(rep, params, tname, side, value):
+            return None
+        cap = str(node.name).strip()[:1].isupper()
+        new = _build(rep.kind, rep.params, cap)
+        self._mark(new, rep, side)
+        self._changes[f'{tname}→{rep.kind}'] += 1
+        return [new]
+
+    def _classify(self, tname, side, value):
+        rep, why = classify(value, side, self.allow_links)
+        if rep is None:
+            self._skip(tname, side, value, why)
+        return rep
+
+    def _carry(self, rep: Replacement, params: dict, tname, side, value):
+        for key in ('as', 'rows'):
+            v = params.get(key, '')
+            if not v:
+                continue
+            if not rep.supports(key):
+                self._skip(tname, side, value,
+                           f'|{key}= not supported by {{{{{rep.kind}}}}}')
+                return False
+            rep.params.append((key, v))
+        return True
+
+    def _mark(self, node, rep: Replacement, side: str):
+        if side == 'before' and not rep.starts_row:
+            self._need_start[id(node)] = node
+        if side == 'after' and not rep.ends_row:
+            self._need_end[id(node)] = node
+
+    def _skip(self, tname, param, value, why):
+        self._unfixed.append((tname, param, value, why))
+        return None
+
+    # -- s-ttl --------------------------------------------------------------
+
+    def _fix_title(self, node: Template, tname: str) -> bool:
+        if not node.has('title'):
+            return False
+        title = str(node.get('title').value)
+        if not TITLE_WITH.search(title):
+            return False
+        if node.has('with') and str(node.get('with').value).strip():
+            self._skip(tname, 'title', title.strip(), '|with= already set')
+            return False
+        m = re.fullmatch(
+            r"(?P<lead>\s*)(?P<t>.*?)\s*<br\s*/?\s*>\s*(?P<q>'*)\s*with\s+"
+            r"(?P<w>.+?)\s*(?P=q)(?P<trail>\s*)", title, flags=re.S | re.I)
+        if not m or re.search(r'<br', m.group('w'), re.I):
+            self._skip(tname, 'title', title.strip(),
+                       'could not split title/with')
+            return False
+        node.add('title', m.group('t'))     # mwparserfromhell keeps spacing
+        node.add('with', m.group('w').strip())
+        self._changes[f'{tname}: title<br>with→|with='] += 1
+        return True
+
+    # -- {{Succession box}} ---------------------------------------------------
+
+    SBOX_PARAMS = ({'before', 'after', 'title', 'years', 'alongside', 'with',
+                    'rows'}
+                   | {f'before{n}' for n in range(2, 6)}
+                   | {f'after{n}' for n in range(2, 6)}
+                   | {f'with{n}' for n in range(2, 26)})
+
+    def _fix_sbox(self, node: Template):
+        tname = 'succession box'
+        params = _params(node)
+        before, after = params.get('before', ''), params.get('after', '')
+        b_bad, a_bad = tracked_before(before), tracked_after(after)
+        if not (b_bad or a_bad):
+            self._fix_title(node, tname)
+            return None
+        extra = {k for k in set(params) - self.SBOX_PARAMS if params[k]}
+        if extra:
+            for side, value, bad in (('before', before, b_bad),
+                                     ('after', after, a_bad)):
+                if bad:
+                    self._skip(tname, side, value,
+                               f'unexpected parameters: {sorted(extra)}')
+            return None
+
+        b_rep = a_rep = None
+        if b_bad:
+            if any(params.get(f'before{n}') for n in range(2, 6)):
+                self._skip(tname, 'before', before, 'has before2+ parameters')
+            else:
+                b_rep = self._classify(tname, 'before', before)
+        if a_bad:
+            if any(params.get(f'after{n}') for n in range(2, 6)):
+                self._skip(tname, 'after', after, 'has after2+ parameters')
+            else:
+                a_rep = self._classify(tname, 'after', after)
+        if b_rep is None and a_rep is None:
+            self._fix_title(node, tname)
+            return None
+
+        rows = params.get('rows', '')
+        if b_rep:
+            if rows:
+                b_rep.params.append(('rows', rows))
+            bef = _build(b_rep.kind, b_rep.params, False)
+            self._mark(bef, b_rep, 'before')
+        else:
+            bef = _build('s-bef', self._side_params(params, 'before', 5, rows),
+                         False)
+        if a_rep:
+            if rows:
+                a_rep.params.append(('rows', rows))
+            aft = _build(a_rep.kind, a_rep.params, False)
+            self._mark(aft, a_rep, 'after')
+        else:
+            aft = _build('s-aft', self._side_params(params, 'after', 5, rows),
+                         False)
+
+        ttl_params = [('title', params.get('title', ''))]
+        for key in ['years', 'alongside', 'with'] + [
+                f'with{n}' for n in range(2, 26)]:
+            if params.get(key):
+                ttl_params.append((key, params[key]))
+        if rows:
+            ttl_params.append(('rows', rows))
+        ttl = _build('s-ttl', ttl_params, False)
+        self._fix_title(ttl, tname)
+
+        parts = []
+        if b_rep:
+            parts.append(f'before→{b_rep.kind}')
+        if a_rep:
+            parts.append(f'after→{a_rep.kind}')
+        self._changes[f'succession box split ({", ".join(parts)})'] += 1
+        return [bef, Text('\n'), ttl, Text('\n'), aft]
+
+    @staticmethod
+    def _side_params(params, side, maxn, rows):
+        out = []
+        if side in params:
+            out.append((side, params[side]))
+        for n in range(2, maxn + 1):
+            if params.get(f'{side}{n}'):
+                out.append((f'{side}{n}', params[f'{side}{n}']))
+        if rows:
+            out.append(('rows', rows))
+        return out
+
+    # -- table rows ---------------------------------------------------------
+
+    def _fix_rows(self, wc):
+        i = 0
+        while i < len(wc.nodes):
+            node = wc.nodes[i]
+            if id(node) in self._need_start and self._need_start[
+                    id(node)] is node:
+                if not self._prev_ends_row(wc.nodes, i):
+                    wc.nodes.insert(i, Text('|-\n'))
+                    i += 1
+            if id(node) in self._need_end and self._need_end[
+                    id(node)] is node:
+                if not self._next_starts_row(wc.nodes, i):
+                    wc.nodes.insert(i + 1, Text('\n|-'))
+                    i += 1
+            i += 1
+
+    def _prev_ends_row(self, nodes, i) -> bool:
+        j = i - 1
+        while j >= 0 and _is_blank(nodes[j]):
+            j -= 1
+        if j < 0:
+            return False
+        node = nodes[j]
+        if isinstance(node, Text):
+            last = str(node).rstrip().splitlines()[-1].strip()
+            return last.startswith('|-') or last.startswith('{|')
+        return self.canon(node) in ROW_ENDERS
+
+    def _next_starts_row(self, nodes, i) -> bool:
+        j = i + 1
+        while j < len(nodes) and _is_blank(nodes[j]):
+            j += 1
+        if j >= len(nodes):
+            return False
+        node = nodes[j]
+        if isinstance(node, Text):
+            first = str(node).lstrip().splitlines()[0].strip()
+            return first.startswith('|-') or first.startswith('|}')
+        return self.canon(node) in ROW_STARTERS
+
+    # -- reporting ----------------------------------------------------------
+
+    def _find_leftovers(self, text: str):
+        """Report tracked values that remain, but were not already logged."""
+        logged = {(p, v) for _, p, v, _ in self._unfixed}
+        for tpl in mwp.parse(text).filter_templates():
+            canon = self.canon(tpl)
+            if canon not in ('s-aft', 's-bef', 'succession box'):
+                continue
+            params = _params(tpl)
+            for side, check in (('after', tracked_after),
+                                ('before', tracked_before)):
+                if canon == 's-aft' and side == 'before':
+                    continue
+                if canon == 's-bef' and side == 'after':
+                    continue
+                v = params.get(side, '')
+                if check(v) and (side, v) not in logged:
+                    self._unfixed.append((canon, side, v, 'not handled'))
+
+
+def make_summary(changes: Counter) -> str:
+    items = ', '.join(f'{label} ×{n}' if n > 1 else label
+                      for label, n in changes.most_common())
+    return (f'Fix succession box misuse ([[:Category:{TRACKING_CAT}]]): '
+            f'{items}')
+
+
+# ---------------------------------------------------------------------------
+# pywikibot bot
+# ---------------------------------------------------------------------------
+
+def load_aliases(site) -> dict:
+    """Map every redirect name of the templates we care about to its
+    canonical name."""
+    import pywikibot
+    aliases = {}
+    for canon in CANONICAL:
+        page = pywikibot.Page(site, canon, ns=10)
+        try:
+            for redir in page.redirects(namespaces=10):
+                aliases[norm_name(redir.title(with_ns=False))] = canon
+        except Exception as exc:   # noqa: BLE001 - keep going offline-ish
+            pywikibot.warning(f'Could not load redirects to {canon}: {exc}')
+    return aliases
+
+
+def default_generator(site, only: str | None):
+    import pywikibot
+    cat = pywikibot.Category(site, f'Category:{TRACKING_CAT}')
+    seen = set()
+    for sub in cat.subcategories():
+        if only and only.lower() not in sub.title().lower():
+            continue
+        pywikibot.info(f'\n<<lightyellow>>Category: {sub.title()}')
+        for page in sub.articles(namespaces=0):
+            if page.title() in seen:
+                continue
+            seen.add(page.title())
+            yield page
+
+
+def main(*args: str) -> None:
+    import pywikibot
+    from pywikibot import pagegenerators
+    from pywikibot.bot import ExistingPageBot, SingleSiteBot
+
+    class SuccessionBoxBot(SingleSiteBot, ExistingPageBot):
+        update_options = {
+            'report': None,
+            'allowlinks': False,
+            'summary': None,
+        }
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.fixer = Fixer(load_aliases(self.site),
+                               allow_links=self.opt.allowlinks)
+            self.report_rows = []
+            self.stats = Counter()
+
+        def skip_page(self, page):
+            if page.namespace() != 0:
+                pywikibot.info(f'Skipping {page} (not an article)')
+                return True
+            if super().skip_page(page):
+                return True
+            if page.isRedirectPage():
+                pywikibot.info(f'Skipping {page} (redirect)')
+                return True
+            return False
+
+        def treat_page(self):
+            page = self.current_page
+            result = self.fixer.fix(page.text)
+            for tname, param, value, why in result.unfixed:
+                self.report_rows.append(
+                    (page.title(), tname, param, value, why))
+            self.stats['unfixed'] += len(result.unfixed)
+            if not result.changes:
+                pywikibot.info('No safely fixable succession box issues.')
+                self.stats['nothing to do'] += 1
+                return
+            summary = self.opt.summary or make_summary(result.changes)
+            if self.put_current(result.text, summary=summary):
+                # With -always pywikibot saves asynchronously, so this
+                # counts edits submitted; failures are logged separately.
+                self.stats['edits submitted'] += 1
+                self.stats.update(result.changes)
+
+        def teardown(self):
+            if self.opt.report:
+                with open(self.opt.report, 'w', newline='',
+                          encoding='utf-8') as fh:
+                    writer = csv.writer(fh, delimiter='\t')
+                    writer.writerow(['page', 'template', 'param', 'value',
+                                     'why'])
+                    writer.writerows(self.report_rows)
+                pywikibot.info(f'Wrote {len(self.report_rows)} unfixed '
+                               f'cases to {self.opt.report}')
+            for key, n in self.stats.most_common():
+                pywikibot.info(f'{key}: {n}')
+            super().teardown()
+
+    local_args = pywikibot.handle_args(args)
+    gen_factory = pagegenerators.GeneratorFactory()
+    local_args = gen_factory.handle_args(local_args)
+
+    options = {}
+    only = None
+    for arg in local_args:
+        opt, _, value = arg.partition(':')
+        if opt == '-always':
+            options['always'] = True
+        elif opt == '-allowlinks':
+            options['allowlinks'] = True
+        elif opt == '-report':
+            options['report'] = value or 'succession_box_report.tsv'
+        elif opt == '-summary':
+            options['summary'] = value
+        elif opt == '-only':
+            only = value
+        else:
+            pywikibot.bot.suggest_help(unknown_parameters=[arg])
+            return
+
+    site = pywikibot.Site()
+    gen = gen_factory.getCombinedGenerator(preload=True)
+    if gen is None:
+        gen = default_generator(site, only)
+        if gen_factory.limit:
+            gen = itertools.islice(gen, gen_factory.limit)
+        gen = pagegenerators.PreloadingGenerator(gen)
+
+    SuccessionBoxBot(generator=gen, site=site, **options).run()
+
+
+def test_file(path: str, allow_links: bool = False) -> None:
+    """Offline: fix a local wikitext file and print a unified diff."""
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    result = Fixer(allow_links=allow_links).fix(text)
+    sys.stdout.writelines(difflib.unified_diff(
+        text.splitlines(True), result.text.splitlines(True),
+        'before', 'after'))
+    print('\nSummary:', make_summary(result.changes)
+          if result.changes else '(no changes)')
+    for row in result.unfixed:
+        print('UNFIXED:', ' | '.join(row))
+
+
+if __name__ == '__main__':
+    argv = sys.argv[1:]
+    tf = [a for a in argv if a.startswith('-testfile:')]
+    if tf:
+        test_file(tf[0].partition(':')[2], '-allowlinks' in argv)
+    else:
+        main(*argv)

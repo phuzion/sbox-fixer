@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+user-config.py
+user-password.py
+*.lwp
+apicache*/
+logs/
+throttle.ctrl
+succession_box_report*.tsv
