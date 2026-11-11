@@ -1,7 +1,9 @@
 """Offline tests for succession_box_fixer (run: python -m pytest -q)."""
 import unittest
+from collections import Counter
 
-from succession_box_fixer import Fixer, classify, make_summary
+from succession_box_fixer import (Fixer, ReportData, build_report, classify,
+                                  make_summary)
 
 
 def fix(text, **kw):
@@ -215,6 +217,46 @@ class WikitextTests(unittest.TestCase):
         ])
         self.assertEqual([u[:3] for u in r.unfixed],
                          [('s-bef', 'before', 'Vacant until 1927')])
+
+    def test_report_single_page(self):
+        stats = Counter({'pages checked': 2, 'pages the bot would edit': 1,
+                         'values the bot would fix': 1,
+                         'values that need a manual fix': 1,
+                         'pages with values needing a manual fix': 1})
+        data = ReportData(
+            True, 'all', stats,
+            fixed=[('B', 's-aft', 'after', 'Incumbent', '{{s-inc}}',
+                    'would fix')],
+            unfixed=[('A', 's-bef', 'before', 'x | y</nowiki>{{z}}',
+                      'no safe pattern matched')])
+        pages = build_report('User:Bot/Report', data)
+        self.assertEqual(len(pages), 1)
+        title, text = pages[0]
+        self.assertEqual(title, 'User:Bot/Report')
+        self.assertIn('~~~~~', text)
+        self.assertIn('report only', text)
+        self.assertIn('| [[:B]] || <nowiki>s-aft</nowiki>', text)
+        self.assertIn('<code><nowiki>{{s-inc}}</nowiki></code>', text)
+        # a closing nowiki inside a value must not end the nowiki early
+        self.assertIn('x | y&lt;/nowiki>{{z}}</nowiki>', text)
+        self.assertNotIn('Status', text)     # report-only has no status
+
+    def test_report_splits_into_subpages(self):
+        data = ReportData(
+            False, 'all', Counter(),
+            fixed=[(f'P{i:03}', 's-aft', 'after', 'Vacant', '{{s-vac}}',
+                    'fixed') for i in range(25)],
+            unfixed=[('Q', 's-aft', 'after', 'Vacant?', 'why')])
+        pages = build_report('User:Bot/R', data, rows_per_page=10)
+        titles = [t for t, _ in pages]
+        self.assertEqual(titles, ['User:Bot/R', 'User:Bot/R/Bot fixes/1',
+                                  'User:Bot/R/Bot fixes/2',
+                                  'User:Bot/R/Bot fixes/3'])
+        main = pages[0][1]
+        self.assertIn('[[User:Bot/R/Bot fixes/3|Part 3]]', main)
+        self.assertIn('| [[:Q]]', main)       # small section stays inline
+        self.assertIn('Status', pages[1][1])
+        self.assertEqual(pages[3][1].count('|-'), 5)
 
     def test_summary(self):
         r = fix('{{s-aft|after=Incumbent}}\n{{s-aft|after=Incumbent}}')

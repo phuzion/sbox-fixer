@@ -43,11 +43,15 @@ Usage examples::
     # Preview everything, ask before each save (default behaviour)
     python succession_box_fixer.py
 
-    # Report only: read every page, write what it would do, edit nothing
+    # Report only: read every page, publish the report wikitable to
+    # User:PhuzBot/Succession box report, edit no articles
     python succession_box_fixer.py -reportonly
 
-    # Report only, just the 'incumbent' subcategories
-    python succession_box_fixer.py -reportonly -only:incumbent -report:inc.tsv
+    # Same, but save the report somewhere else
+    python succession_box_fixer.py -reportonly -reportpage:"User:Example/Report"
+
+    # Report only, nothing saved on the wiki at all (no login needed)
+    python succession_box_fixer.py -reportonly -noreportpage
 
     # Specific pages / any pywikibot page generator
     python succession_box_fixer.py -page:"Some article" -always
@@ -59,10 +63,17 @@ Options:
 
 -only:<text>      Only process subcategories whose name contains <text>
                   (case-insensitive), e.g. -only:incumbent, -only:"'before'".
--reportonly      Never edit anything (no login, no prompts): only read the
-                  pages and write the report. Implies -report.
--report:<file>    Write a TSV report with one row per misused value: what it
-                  would be / was replaced with, or why it needs a manual fix
+-reportonly      Never edit articles (no prompts): only read the pages and
+                  build the report.
+-reportpage:<t>   Wiki page the report is saved to as a wikitable (default
+                  "User:PhuzBot/Succession box report"). Long sections go on
+                  numbered subpages (<t>/Manual fixes/1, <t>/Bot fixes/1...).
+                  It is only published when the run finishes; an interrupted
+                  run saves it to succession_box_report.wiki instead.
+-noreportpage     Don't publish the report; save its wikitext to
+                  succession_box_report.wiki (no login needed with
+                  -reportonly).
+-report:<file>    Also write a local TSV with one row per misused value
                   (default name: succession_box_report.tsv).
 -allowlinks       Also convert "abolished"/"dissolved"/"extinct" values that
                   contain wikilinks into {{s-non|reason=...}}.
@@ -726,6 +737,167 @@ DEFAULT_REPORT = 'succession_box_report.tsv'
 REPORT_HEADER = ('page', 'status', 'template', 'param', 'current value',
                  'replacement / reason')
 
+# On-wiki report. Change the location with -reportpage:<title>.
+DEFAULT_REPORT_PAGE = 'User:PhuzBot/Succession box report'
+# A section with more rows than this is split onto numbered subpages
+# (<report page>/Manual fixes/1, /2, ...) to stay well under the 2 MB page
+# limit and keep the tables quick to render.
+REPORT_ROWS_PER_PAGE = 2000
+# Where the report wikitext goes when it is not (or cannot be) published.
+LOCAL_WIKI_REPORT = 'succession_box_report.wiki'
+REPO_URL = 'https://github.com/phuzion/sbox-fixer'
+
+
+# ---------------------------------------------------------------------------
+# On-wiki report
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReportData:
+    reportonly: bool
+    scope: str
+    stats: Counter
+    fixed: list = field(default_factory=list)
+    # fixed: [(page, template, param, value, replacement, status)]
+    unfixed: list = field(default_factory=list)
+    # unfixed: [(page, template, param, value, why)]
+
+
+def _code(value, limit: int = 300) -> str:
+    """Show wikitext literally inside a table cell."""
+    v = re.sub(r'\s+', ' ', str(value)).strip()
+    if len(v) > limit:
+        v = v[:limit].rstrip() + '…'
+    if not v:
+        return ''
+    v = re.sub(r'(?i)</nowiki', '&lt;/nowiki', v)
+    return f'<code><nowiki>{v}</nowiki></code>'
+
+
+def _plain(value) -> str:
+    v = re.sub(r'\s+', ' ', str(value)).strip()
+    v = re.sub(r'(?i)</nowiki', '&lt;/nowiki', v)
+    return f'<nowiki>{v}</nowiki>' if v else ''
+
+
+def _table(headers, rows) -> str:
+    out = ['{| class="wikitable sortable" style="font-size:90%"',
+           '! ' + ' !! '.join(headers)]
+    for row in rows:
+        out.append('|-')
+        out.append('| ' + ' || '.join(row))
+    out.append('|}')
+    return '\n'.join(out)
+
+
+def build_report(root: str, data: ReportData,
+                 rows_per_page: int = REPORT_ROWS_PER_PAGE
+                 ) -> list[tuple[str, str]]:
+    """Return [(page title, wikitext), ...]; the first entry is *root*."""
+    s = data.stats
+    fixed_heading = ('Would be fixed by the bot' if data.reportonly
+                     else 'Fixed by the bot')
+
+    manual_rows = [
+        (f'[[:{page}]]', _plain(tname), _plain(param), _code(value),
+         _plain(why))
+        for page, tname, param, value, why in sorted(
+            data.unfixed, key=lambda r: r[0])]
+    fixed_headers = ['Page', 'Template', 'Parameter', 'Current value',
+                     'Replacement']
+    if not data.reportonly:
+        fixed_headers.append('Status')
+    fixed_rows = []
+    for page, tname, param, value, new, status in sorted(
+            data.fixed, key=lambda r: r[0]):
+        row = [f'[[:{page}]]', _plain(tname), _plain(param), _code(value),
+               _code(new)]
+        if not data.reportonly:
+            row.append(_plain(status))
+        fixed_rows.append(tuple(row))
+
+    sections = [
+        ('Needs a manual fix', 'Manual fixes',
+         ['Page', 'Template', 'Parameter', 'Current value', 'Reason'],
+         manual_rows),
+        (fixed_heading, 'Bot fixes', fixed_headers, fixed_rows),
+    ]
+
+    if data.reportonly:
+        run_type = "report only (no articles were edited)"
+        fixed_line = (f"* Pages the bot would edit: "
+                      f"{s['pages the bot would edit']:,}\n"
+                      f"* Values the bot would fix: "
+                      f"{s['values the bot would fix']:,}")
+    else:
+        run_type = 'editing run'
+        fixed_line = (f"* Edits submitted: {s['edits submitted']:,}\n"
+                      f"* Values fixed: {s['values fixed']:,}")
+
+    main = [
+        "''This page is generated by "
+        f"[{REPO_URL} sbox-fixer] and is overwritten on every run, so "
+        "changes made here will be lost. It lists misused succession box "
+        "values found in [[:Category:" + TRACKING_CAT + "]].''",
+        '',
+        "* '''Last updated:''' ~~~~~",
+        f"* '''Run type:''' {run_type}",
+        f"* '''Scope:''' {data.scope}",
+        f"* Pages checked: {s['pages checked']:,}",
+        fixed_line,
+        f"* Values needing a manual fix: "
+        f"{s['values that need a manual fix']:,} on "
+        f"{s['pages with values needing a manual fix']:,} pages",
+    ]
+
+    reasons = Counter(r[4] for r in data.unfixed)
+    if reasons:
+        main += ['', '== Why values need a manual fix ==',
+                 _table(['Reason', 'Values'],
+                        [(_plain(why), f'{n:,}')
+                         for why, n in reasons.most_common()])]
+
+    pages = []
+    for heading, subname, headers, rows in sections:
+        main += ['', f'== {heading} ==']
+        if not rows:
+            main.append("''None.''")
+            continue
+        if len(rows) <= rows_per_page:
+            main.append(_table(headers, rows))
+            continue
+        chunks = [rows[i:i + rows_per_page]
+                  for i in range(0, len(rows), rows_per_page)]
+        main.append(f'{len(rows):,} rows, split over {len(chunks)} pages:')
+        for n, chunk in enumerate(chunks, 1):
+            title = f'{root}/{subname}/{n}'
+            first, last = _link_text(chunk[0][0]), _link_text(chunk[-1][0])
+            main.append(f'* [[{title}|Part {n}]] ({first} – {last})')
+            pages.append((title, '\n'.join([
+                f"''Part {n} of {len(chunks)} of the "
+                f"[[{root}#{heading}|{heading.lower()}]] list in "
+                f"[[{root}]]. Generated by [{REPO_URL} sbox-fixer]; "
+                "changes made here will be lost. Last updated: ~~~~~''",
+                '',
+                _table(headers, chunk),
+            ])))
+    return [(root, '\n'.join(main) + '\n')] + pages
+
+
+def save_local_report(pages, why: str, path: str = LOCAL_WIKI_REPORT):
+    """Write the report wikitext to a local file instead of the wiki."""
+    import pywikibot
+    with open(path, 'w', encoding='utf-8') as fh:
+        for title, text in pages:
+            fh.write(f'<!-- ===== {title} ===== -->\n{text}\n')
+    pywikibot.warning(f'Report not published because {why}; its wikitext '
+                      f'({len(pages)} page(s)) was saved to {path}')
+
+
+def _link_text(link: str) -> str:
+    """'[[:Foo]]' -> 'Foo' (escaped for use in a list item)."""
+    return _plain(link[3:-2]) if link.startswith('[[:') else _plain(link)
+
 
 def load_aliases(site) -> dict:
     """Map every redirect name of the templates we care about to its
@@ -766,6 +938,8 @@ def main(*args: str) -> None:
         update_options = {
             'report': None,
             'reportonly': False,
+            'reportpage': DEFAULT_REPORT_PAGE,
+            'scope': '',
             'allowlinks': False,
             'summary': None,
         }
@@ -775,6 +949,8 @@ def main(*args: str) -> None:
             self.fixer = Fixer(load_aliases(self.site),
                                allow_links=self.opt.allowlinks)
             self.stats = Counter()
+            self.fixed_rows = []
+            self.unfixed_rows = []
             self.report_file = self.report_writer = None
             if self.opt.report:
                 # utf-8-sig so Excel detects the encoding; rows are written
@@ -788,6 +964,11 @@ def main(*args: str) -> None:
                 self.report_file.flush()
 
         def write_report(self, title, result, fixed_status):
+            for tname, param, value, new in result.fixed:
+                self.fixed_rows.append(
+                    (title, tname, param, value, new, fixed_status))
+            for row in result.unfixed:
+                self.unfixed_rows.append((title, *row))
             if not self.report_writer:
                 return
             for tname, param, value, new in result.fixed:
@@ -819,7 +1000,7 @@ def main(*args: str) -> None:
                 self.stats['pages with values needing a manual fix'] += 1
 
             if self.opt.reportonly:
-                # Never edits, never logs in, never asks for confirmation.
+                # Never edits articles and never asks for confirmation.
                 self.write_report(page.title(), result, 'would fix')
                 n = len(result.fixed)
                 pywikibot.info(f'{n} fixable, {len(result.unfixed)} '
@@ -846,10 +1027,62 @@ def main(*args: str) -> None:
         def teardown(self):
             if self.report_file:
                 self.report_file.close()
-                pywikibot.info(f'Report written to {self.opt.report}')
+                pywikibot.info(f'TSV report written to {self.opt.report}')
             for key, n in sorted(self.stats.items()):
                 pywikibot.info(f'{key}: {n}')
-            super().teardown()
+            try:
+                self.publish_report()
+            finally:
+                super().teardown()
+
+        def publish_report(self):
+            root = self.opt.reportpage or DEFAULT_REPORT_PAGE
+            data = ReportData(self.opt.reportonly, self.opt.scope,
+                              self.stats, self.fixed_rows, self.unfixed_rows)
+            pages = build_report(root, data)
+            if not self.opt.reportpage:
+                save_local_report(pages, 'publishing was turned off '
+                                  '(-noreportpage)')
+                return
+            if not getattr(self, 'generator_completed', False):
+                # Don't let a partial run overwrite a complete report.
+                save_local_report(pages, 'the run did not finish')
+                return
+            summary = (
+                f'Updating succession box misuse report: '
+                f'{len(self.unfixed_rows):,} values need a manual fix, '
+                f'{len(self.fixed_rows):,} '
+                + ('fixable by bot' if self.opt.reportonly else 'bot fixes'))
+            try:
+                for title, text in pages:
+                    pywikibot.info(f'Saving report page [[{title}]]')
+                    page = pywikibot.Page(self.site, title)
+                    page.text = text
+                    page.save(summary=summary, minor=False, bot=True)
+                self.retire_old_subpages(root, pages)
+            except Exception as exc:  # noqa: BLE001 - keep the report
+                pywikibot.error(f'Could not save the report page: {exc}')
+                save_local_report(pages, 'saving it failed')
+
+        def retire_old_subpages(self, root, pages):
+            """Blank-out subpages left over from a longer earlier report."""
+            used = {t for t, _ in pages}
+            for subname in ('Manual fixes', 'Bot fixes'):
+                n = 1
+                while True:
+                    title = f'{root}/{subname}/{n}'
+                    n += 1
+                    if title in used:
+                        continue
+                    page = pywikibot.Page(self.site, title)
+                    if not page.exists():
+                        break
+                    if page.text.startswith("''No longer used"):
+                        continue
+                    page.text = (f"''No longer used: this part of the "
+                                 f"report is now empty. See [[{root}]].''\n")
+                    page.save(summary='Succession box report: part no '
+                              'longer used', minor=False, bot=True)
 
     local_args = pywikibot.handle_args(args)
     gen_factory = pagegenerators.GeneratorFactory()
@@ -867,6 +1100,14 @@ def main(*args: str) -> None:
             options['report'] = value or DEFAULT_REPORT
         elif opt == '-reportonly':
             options['reportonly'] = True
+        elif opt == '-reportpage':
+            if not value:
+                pywikibot.error('-reportpage needs a page title, e.g. '
+                                '-reportpage:"User:Example/Report"')
+                return
+            options['reportpage'] = value
+        elif opt == '-noreportpage':
+            options['reportpage'] = None
         elif opt == '-summary':
             options['summary'] = value
         elif opt == '-only':
@@ -876,10 +1117,35 @@ def main(*args: str) -> None:
             return
 
     if options.get('reportonly'):
-        options.setdefault('report', DEFAULT_REPORT)
         options.pop('always', None)
 
     site = pywikibot.Site()
+
+    # Describe what this run covers, for the report header.
+    scope = []
+    if gen_factory.gens:
+        scope.append('selected pages only')
+    elif only:
+        scope.append(f'subcategories matching "{only}"')
+    else:
+        scope.append(f'all of [[:Category:{TRACKING_CAT}]]')
+    if gen_factory.limit:
+        scope.append(f'limited to {gen_factory.limit:,} pages')
+    options['scope'] = ', '.join(scope)
+
+    # Log in now rather than after a long run, so a missing username or
+    # password shows up straight away.
+    if options.get('reportpage', DEFAULT_REPORT_PAGE) or not options.get(
+            'reportonly'):
+        try:
+            site.login()
+        except Exception as exc:  # noqa: BLE001
+            pywikibot.error(
+                f'Could not log in ({exc}). Saving the report page needs a '
+                'logged-in account; set usernames[...] in user-config.py, '
+                'or use -noreportpage to keep the report local.')
+            return
+
     gen = gen_factory.getCombinedGenerator(preload=True)
     if gen is None:
         gen = default_generator(site, only)
